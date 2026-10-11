@@ -1,0 +1,123 @@
+#!/usr/bin/env node
+/**
+ * Web content extractor powered by Mozilla Readability (Firefox Reader View).
+ *
+ * Usage:
+ *   extract <url> [--format markdown|text] [--timeout 20000]
+ *
+ * Prints JSON to stdout: { title, byline, excerpt, siteName, content, length }
+ * Errors go to stderr as {"error": "..."} with non-zero exit.
+ */
+import { JSDOM } from "jsdom";
+import { Readability } from "@mozilla/readability";
+import TurndownService from "turndown";
+
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+const MAX_REDIRECTS = 10;
+
+function parseArgs(argv) {
+  const out = { format: "markdown", timeout: 20000, url: null };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--format") out.format = argv[++i];
+    else if (a === "--timeout") out.timeout = Number(argv[++i]);
+    else if (!a.startsWith("--") && !out.url) out.url = a;
+  }
+  return out;
+}
+
+/** Manual redirect following with full chain tracking. */
+async function fetchWithRedirects(startUrl, timeout) {
+  const chain = [];
+  let current = startUrl;
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    let res;
+    try {
+      res = await fetch(current, {
+        headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml" },
+        signal: AbortSignal.timeout(timeout),
+        redirect: "manual",
+      });
+    } catch (e) {
+      throw new Error(`fetch failed: ${e.message}`);
+    }
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      const loc = res.headers.get("location");
+      await res.arrayBuffer().catch(() => {});
+      if (!loc) throw new Error(`redirect ${res.status} without location header`);
+      const next = new URL(loc, current).href;
+      chain.push({ status: res.status, from: current, to: next });
+      current = next;
+      continue;
+    }
+    return { res, chain, finalUrl: current };
+  }
+  throw new Error(`too many redirects (>${MAX_REDIRECTS}), possible loop`);
+}
+
+const turndown = new TurndownService({
+  headingStyle: "atx",
+  codeBlockStyle: "fenced",
+});
+turndown.remove(["script", "style", "noscript", "iframe"]);
+
+async function main() {
+  const { url, format, timeout } = parseArgs(process.argv.slice(2));
+  if (!url) {
+    console.error(JSON.stringify({ error: "usage: extract <url> [--format markdown|text]" }));
+    process.exit(2);
+  }
+
+  let fetched;
+  try {
+    fetched = await fetchWithRedirects(url, timeout);
+  } catch (e) {
+    console.error(JSON.stringify({ error: e.message }));
+    process.exit(1);
+  }
+  const { res, chain, finalUrl } = fetched;
+  if (!res.ok) {
+    console.error(JSON.stringify({ error: `HTTP ${res.status} ${res.statusText}`, url: finalUrl, redirects: chain }));
+    process.exit(1);
+  }
+  const ct = res.headers.get("content-type") || "";
+  if (!/html/i.test(ct)) {
+    console.error(JSON.stringify({ error: `not an HTML page (content-type: ${ct})`, url: finalUrl, redirects: chain }));
+    process.exit(1);
+  }
+
+  const html = await res.text();
+  const dom = new JSDOM(html, { url: finalUrl });
+  const article = new Readability(dom.window.document).parse();
+  if (!article || !article.textContent?.trim()) {
+    console.error(JSON.stringify({ error: "readability found no article content", url: finalUrl, redirects: chain }));
+    process.exit(1);
+  }
+
+  const content =
+    format === "text"
+      ? article.textContent.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim()
+      : turndown.turnDown(article.content);
+
+  console.log(
+    JSON.stringify(
+      {
+        title: article.title || "",
+        byline: article.byline || "",
+        excerpt: article.excerpt || "",
+        siteName: article.siteName || "",
+        url: finalUrl,
+        redirects: chain,
+        length: content.length,
+        content,
+      },
+      null,
+      1
+    )
+  );
+}
+
+main();
